@@ -7,6 +7,7 @@
 spark.conf.set("spark.databricks.delta.optimizeWrite.enabled","true")
 spark.conf.set("spark.databricks.delta.autoCompact.enabled","true")
 spark.conf.set("spark.databricks.delta.properties.defaults.enableChangeDataFeed", True)
+spark.conf.set("spark.databricks.adaptive.autoBroadcastJoinThreshold", "2GB")
 
 # COMMAND ----------
 
@@ -18,6 +19,7 @@ root_path = f"/Users/{user}/tmp/demo/cdc_raw"
 customer_path = f"{root_path}/customers"
 transaction_path = f"{root_path}/transactions"
 orders_path = f"{root_path}/orders"
+products_path = f"{root_path}/products"
 checkpointLocation = f"/Users/{user}/tmp/demo/cp"
 schemaLocation = f"/Users/{user}/tmp/demo/schema"
 # bronze_path = f"/Users/{user}/tmp/demo/bronze"
@@ -29,6 +31,10 @@ gold_path = f"/Users/{user}/tmp/demo/gold"
 dbutils.fs.rm(checkpointLocation, True)
 dbutils.fs.rm(silver_path, True)
 dbutils.fs.rm(gold_path, True)
+
+# COMMAND ----------
+
+dbutils.fs.rm(f'/Users/{user}/tmp/error', True)
 
 # COMMAND ----------
 
@@ -52,6 +58,18 @@ item_name string,
 operation string,
 operation_date string,
 transaction_id string) USING delta
+''')
+
+# COMMAND ----------
+
+spark.sql(f'''
+CREATE TABLE delta.`{silver_path}/products` (
+id STRING,
+item_name STRING,
+item_operation STRING,
+item_operation_date STRING,
+order_id STRING,
+price STRING) USING delta
 ''')
 
 # COMMAND ----------
@@ -89,6 +107,17 @@ orders_stream = (
 
 # COMMAND ----------
 
+products_stream = (
+       spark.readStream.format("cloudFiles")
+          .option('cloudFiles.format', 'json')
+          .option('cloudFiles.schemaLocation', f'{schemaLocation}/products')
+          .option('cloudFiles.maxBytesPerTrigger', 2000000)
+          .load(products_path)
+          .drop('_rescued_data')
+     )
+
+# COMMAND ----------
+
 spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
 (customer_stream
   .writeStream
@@ -113,6 +142,15 @@ spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
   .format('delta')
   .option('checkpointLocation', f'{checkpointLocation}/silver/orders')
   .start(f'{silver_path}/orders'))
+
+# COMMAND ----------
+
+spark.sparkContext.setLocalProperty("spark.scheduler.pool", str(uuid.uuid4()))
+(products_stream
+  .writeStream
+  .format('delta')
+  .option('checkpointLocation', f'{checkpointLocation}/silver/products')
+  .start(f'{silver_path}/products'))
 
 # COMMAND ----------
 
@@ -152,15 +190,21 @@ c = (
             .sequenceBy('order_operation_date')
     )
 
+d = (
+      Stream.fromPath(f'{silver_path}/products')
+            .to(lambda df: df.withColumnRenamed('id', 'product_id'))
+            .to(lambda df: df.withColumnRenamed('item_name', 'product_name'))
+            .primaryKeys('product_id')
+            .sequenceBy('item_operation_date')
+    )
+
 j = (
-  a.join(b, 'left')
-   .on(lambda l, r: l['customer_id'] == r['customer_id'])
-   .dedupJoinKeys('customer_id')
-#  .onKeys('customer_id')
-  .join(c, 'left')
-  .on(lambda l, r: l['transaction_id'] == r['transaction_id'])
-  .dedupJoinKeys('transaction_id')
-#  .onKeys('transaction_id')
+  a.join(b, 'right')
+  .onKeys('customer_id')
+  .join(c, 'right')
+  .onKeys('transaction_id')
+  .join(d, 'left')
+  .onKeys('order_id')
   .writeToPath(f'{gold_path}/joined')
 #  .foreachBatch(mergeGold)
   .option("checkpointLocation", f'{checkpointLocation}/gold/joined')
@@ -173,42 +217,26 @@ j = (
 aa = spark.read.format('delta').load(f'{silver_path}/customers').withColumnRenamed('id', 'customer_id').withColumnRenamed('operation', 'customer_operation').withColumnRenamed('operation_date', 'customer_operation_date')
 bb = spark.read.format('delta').load(f'{silver_path}/transactions').withColumnRenamed('id', 'transaction_id')
 oo = spark.read.format('delta').load(f'{silver_path}/orders').withColumnRenamed('id', 'order_id').withColumnRenamed('operation', 'order_operation').withColumnRenamed('operation_date', 'order_operation_date')
-aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'left').drop(bb['customer_id'])
-cc = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'left').drop(oo['transaction_id'])
+pp = spark.read.format('delta').load(f'{silver_path}/products').withColumnRenamed('id', 'product_id').withColumnRenamed('item_name', 'product_name')
+aa_bb = aa.join(bb, bb['customer_id'] == aa['customer_id'], 'right').drop(aa['customer_id'])
+aa_bb_oo = aa_bb.join(oo, oo['transaction_id'] == aa_bb['transaction_id'], 'right').drop(aa_bb['transaction_id'])
+cc = aa_bb_oo.join(pp, pp['order_id'] == aa_bb_oo['order_id'], 'left').drop(pp['order_id'])
 cc.count()
+
+# COMMAND ----------
+
+# ab = spark.read.format('delta').load(f"{a.join(b, 'left').stagingPath()}/data")
+# ab_cols = ab.columns
+# ab_cols.sort()
+# aa_bb_cols = aa_bb.columns
+# aa_bb_cols.sort()
+# print(ab.select(ab_cols).exceptAll(aa_bb.select(aa_bb_cols)).count())
+# print(aa_bb.select(aa_bb_cols).exceptAll(ab.select(ab_cols)).count())
 
 # COMMAND ----------
 
 df = spark.read.format('delta').load(f'{gold_path}/joined').select(cc.columns)
 df.count()
-
-# COMMAND ----------
-
-a_b = spark.read.format('delta').load(f"{a.join(b, 'left').stagingPath()}/data")
-
-# COMMAND ----------
-
-a_b_cols = a_b.columns
-a_b_cols.sort()
-aa_bb_cols = aa_bb.columns
-aa_bb_cols.sort()
-
-# COMMAND ----------
-
-print(a_b.select(a_b_cols).exceptAll(aa_bb.select(aa_bb_cols)).count())
-print(aa_bb.select(aa_bb_cols).exceptAll(a_b.select(a_b_cols)).count())
-
-# COMMAND ----------
-
-display(a_b.select(a_b_cols).exceptAll(aa_bb.select(aa_bb_cols)))
-
-# COMMAND ----------
-
-display(a_b.select(a_b_cols).where("customer_id = 'e6cbdb79-32f0-4490-95ac-e860a0b577c7'"))
-
-# COMMAND ----------
-
-display(aa_bb.select(aa_bb_cols).where("customer_id = 'e6cbdb79-32f0-4490-95ac-e860a0b577c7'"))
 
 # COMMAND ----------
 
@@ -219,65 +247,110 @@ cc_cols.sort()
 
 # COMMAND ----------
 
-display(a_b.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'"))
-
-# COMMAND ----------
-
-display(DeltaTable.forPath(spark, path = f'{gold_path}/joined').history())
-
-# COMMAND ----------
-
 print(df.select(df_cols).exceptAll(cc.select(cc_cols)).count())
 print(cc.select(cc_cols).exceptAll(df.select(df_cols)).count())
 
 # COMMAND ----------
 
-display(cc.select(cc_cols).exceptAll(df.select(df_cols)))
+# display(DeltaTable.forPath(spark, f'{gold_path}/joined').history())
 
 # COMMAND ----------
 
-display(df.select(df_cols).exceptAll(cc.select(cc_cols)))
+# a = df.withColumn('_rn', F.row_number().over(Window.partitionBy(['customer_id', 'transaction_id', 'order_id', 'product_id']).orderBy(['customer_id']))).where('_rn = 1')
 
 # COMMAND ----------
 
-display(df.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'").orderBy('order_id'))
+# display(a.select(df_cols).exceptAll(cc.select(cc_cols)))
 
 # COMMAND ----------
 
-display(aa.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'"))
+# path = (a.join(b, 'right')).stagingPath()
+# datatdf = spark.read.format('delta').load(f'{path}/data')
 
 # COMMAND ----------
 
-display(cc.where("customer_id = '29abcf3e-41ea-47ab-8b3f-3969115daef8'").orderBy('order_id'))
+# display(datatdf.where("transaction_id = '91c71211-576a-46c1-bcde-20572e490809'"))
 
 # COMMAND ----------
 
-display(df.select('transaction_id').exceptAll(cc.select('transaction_id')))
+# path = (a.join(b, 'right')
+#   .onKeys('customer_id')
+#   .join(c)).stagingPath()
+# dataodf = spark.read.format('delta').option('versionAsOf', 5).load(f'{path}/data')
 
 # COMMAND ----------
 
-display(df.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+# DeltaTable.forPath(spark, (a.join(b, 'right')
+#   .onKeys('customer_id')
+#   .join(c)).stagingPath() + '/data').history().display()
 
 # COMMAND ----------
 
-display(cc.where("order_id = 'afefca93-beca-4f4b-b976-bacafcb24380'"))
+# dataodf.createOrReplaceTempView('test')
 
 # COMMAND ----------
 
-display(df.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+# %sql
+
+# SELECT *, row_number() over(partition by transaction_id, order_id, CASE WHEN customer_id is null then max else customer_id end order by customer_id DESC) as rn FROM (
+# SELECT customer_id, transaction_id, order_id, max(customer_id) over(partition by transaction_id, order_id order by customer_id DESC ) as max
+#   from test
+# )
+# where order_id = 'a60833dd-9df1-401c-9d90-97c4daa1a70e'
 
 # COMMAND ----------
 
-display(cc.where("transaction_id = '6433a31b-dbc6-4097-8fe7-653ee06fccd8'"))
+#display(dataodf.where("order_id = '2e949785-1ffe-4fdf-b814-9f1d09cb3ae2'"))
 
 # COMMAND ----------
 
-#%fs
-
-#ls /Users/leon.eller@databricks.com/tmp/demo/both
+#display(aa_bb_oo.where("order_id = 'a60833dd-9df1-401c-9d90-97c4daa1a70e'"))
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC 
-# MAGIC --SELECT * FROM delta.`/Users/leon.eller@databricks.com/tmp/demo/newRight` WHERE transaction_id is null --ORDER BY ts
+# df = spark.read.format('delta').option('versionAsOf', 10).load(f'{gold_path}/joined')
+# display(df.select(df_cols).where("product_id = '6a7ba336-932e-4024-99ae-75f3c99acd47'"))
+
+# COMMAND ----------
+
+# display(df.select(df_cols).where("product_id = '426d1e10-61a7-4f56-af33-403f781a7ea6'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("product_id = '426d1e10-61a7-4f56-af33-403f781a7ea6'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).exceptAll(df.select(df_cols)))
+
+# COMMAND ----------
+
+# display(df.select(df_cols).exceptAll(cc.select(cc_cols)))
+
+# COMMAND ----------
+
+# display(df.select(df_cols).where("customer_id = 'cd3b7176-ef20-4120-91c0-ff470718d419' and order_id = '411173c8-337f-441c-9586-d68418fc3c66'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("customer_id = 'cd3b7176-ef20-4120-91c0-ff470718d419' and order_id = '411173c8-337f-441c-9586-d68418fc3c66'"))
+
+# COMMAND ----------
+
+# display(df.select('transaction_id').exceptAll(cc.select('transaction_id')))
+
+# COMMAND ----------
+
+# display(df.where("order_id = '4f17f32c-2cc2-4a03-a97b-a164fab8e266'"))
+
+# COMMAND ----------
+
+# display(cc.where("order_id = '4f17f32c-2cc2-4a03-a97b-a164fab8e266'"))
+
+# COMMAND ----------
+
+# display(df.select(cc_cols).where("transaction_id = '32dcfab0-6039-4c85-9f83-14a9f66bd0f6'"))
+
+# COMMAND ----------
+
+# display(cc.select(cc_cols).where("transaction_id = '32dcfab0-6039-4c85-9f83-14a9f66bd0f6'"))
